@@ -1,7 +1,13 @@
 """
 app.py — Streamlit UI for TripMate, backed by the n8n agent workflow.
 
-This file's ENTIRE job is:
+    python3 -m streamlit run app.py
+
+WHAT CHANGED FROM THE PYTHON-AGENT VERSION: this file no longer contains
+or imports any planning logic at all. There's no agent.py, no tools.py, no
+schema.py — all of that (the tool-calling loop, the three real API calls,
+the structured-output schema) now lives inside the n8n workflow
+("TripMate_Agent_Webhook.json"). This file's ENTIRE job is:
 
   1. Collect trip preferences from the sidebar (same UI as before)
   2. POST them as JSON to the n8n webhook
@@ -137,6 +143,17 @@ if generate_button_clicked:
             # full tool-calling agent loop (multiple LLM + API round trips)
             # before it can respond — this can genuinely take 15-30+ seconds.
             response = requests.post(N8N_WEBHOOK_URL, json=request_payload, timeout=120)
+
+            # DEBUG: requests silently converts POST to GET when following a
+            # 301/302 redirect. If N8N_WEBHOOK_URL doesn't exactly match
+            # n8n's expected URL (trailing slash, http vs https, etc.), a
+            # redirect can happen here and your POST becomes a GET before
+            # n8n ever sees it — which is exactly the "not registered for
+            # GET requests" error. This shows if that happened.
+            if response.history:
+                redirect_chain = " -> ".join(r.url for r in response.history) + " -> " + response.url
+                st.warning(f"⚠️ Request was redirected (this may have turned your POST into a GET): {redirect_chain}")
+
             response.raise_for_status()
             result = response.json()
 
