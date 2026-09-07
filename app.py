@@ -56,7 +56,7 @@ def pick_emoji_for_category(category_text: str) -> str:
 st.title("🗺️ TripMate")
 st.caption("Tell me where and how long — I'll build a real, walkable day-by-day plan around what you actually like.")
 
-if not N8N_WEBHOOK_URL or N8N_WEBHOOK_URL == "PASTE_YOUR_N8N_WEBHOOK_URL_HERE":
+if not N8N_WEBHOOK_URL:
     st.error(
         "Set N8N_WEBHOOK_URL near the top of app.py to your n8n workflow's "
         "Webhook node URL, e.g. https://your-instance.app.n8n.cloud/webhook/plan-trip"
@@ -156,8 +156,6 @@ if generate_button_clicked:
             st.error(f"Couldn't reach the agent: {e}")
             st.stop()
 
-    if itinerary:
-        st.balloons()
 
         st.header(f"{itinerary['destination_name']} · {itinerary['number_of_days']} days")
 
