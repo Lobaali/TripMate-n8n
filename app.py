@@ -22,13 +22,14 @@ result is DISPLAYED.
 
 WHY THERE'S A DIRECT NOMINATIM CALL HERE: this file has no access to
 tools.py's geocode_destination() — that logic lives inside n8n now. So the
-destination_looks_valid() pre-check below makes its own small, direct call
+check_destination() pre-check below makes its own small, direct call
 to the same free geocoding service, purely to reject an obvious typo like
 "asdlkfj" in under a second instead of sending it all the way to n8n,
 waiting through a full agent run, and getting back a raw HTTP error.
 """
 
 import json
+import time
 import requests
 import streamlit as st
 
@@ -46,34 +47,54 @@ st.set_page_config(page_title="TripMate", page_icon="🗺️", layout="wide")
 N8N_WEBHOOK_URL = "https://lobali.app.n8n.cloud/webhook/plan-trip"
 
 
-def destination_looks_valid(destination_name: str) -> bool:
+def check_destination(destination_name: str, max_retries: int = 3):
     """
-    Quick pre-check: confirms the destination resolves to a real place via
-    Nominatim (a free geocoding service, no API key needed) BEFORE POSTing
-    to n8n and waiting through a full agent run over a typo.
+    Confirms the destination resolves to a real place via Nominatim (a
+    free geocoding service, no API key needed) BEFORE POSTing to n8n and
+    waiting through a full agent run over a typo.
 
-    This duplicates the geocoding n8n's own agent will do anyway — that's
-    fine, it's a free service and this call is deliberately tiny (limit=1,
-    8-second timeout). The point isn't to avoid n8n calling it too; it's
-    to fail fast, locally, with a friendly message.
+    WHY THREE OUTCOMES INSTEAD OF TRUE/FALSE: an earlier version of this
+    function failed OPEN on persistent 429s — if Nominatim stayed
+    rate-limited through every retry, it just let the destination through
+    unverified. In practice this meant testing two destinations back to
+    back could exhaust the retry budget on the second one and silently
+    wave real gibberish straight into a full agent run, defeating the
+    entire point of validating first. Now a persistent 429 is reported as
+    "unknown" rather than silently treated as "valid", so the caller can
+    tell the user to wait a moment instead of either blocking forever OR
+    quietly letting garbage through.
 
     Returns:
-        True if the destination looks real, or if the geocoding service
-        itself couldn't be reached (fails open — better to let the n8n
-        workflow's own attempt surface a real problem than to block
-        someone here over a flaky network blip).
+        "valid"   — Nominatim found a real match.
+        "invalid" — Nominatim reached us fine and found nothing.
+        "unknown" — couldn't get a real answer (rate-limited on every
+                    retry, or a network/timeout issue). The caller should
+                    ask the user to wait and try again, NOT proceed as if
+                    it were valid.
     """
-    try:
-        response = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": destination_name, "format": "json", "limit": 1},
-            headers={"User-Agent": "TripMate-Validator/1.0"},
-            timeout=8,
-        )
-        response.raise_for_status()
-        return bool(response.json())  # empty list = Nominatim found nothing real
-    except requests.exceptions.RequestException:
-        return True
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": destination_name, "format": "json", "limit": 1},
+                headers={"User-Agent": "TripMate-Validator/1.0"},
+                timeout=8,
+            )
+            response.raise_for_status()
+            return "valid" if response.json() else "invalid"
+        except requests.exceptions.HTTPError as e:
+            is_rate_limited = e.response is not None and e.response.status_code == 429
+            if is_rate_limited and attempt < max_retries:
+                time.sleep(attempt)
+                continue
+            return "unknown"
+        except requests.exceptions.RequestException:
+            if attempt < max_retries:
+                time.sleep(attempt)
+                continue
+            return "unknown"
+
+    return "unknown"
 
 
 def pick_emoji_for_category(category_text: str) -> str:
@@ -170,14 +191,27 @@ if generate_button_clicked:
     # HTTPError traceback bubbling up from n8n's geocode_destination call.
     # -------------------------------------------------------------------
     with st.spinner("Checking destination..."):
-        destination_is_valid = destination_looks_valid(destination_name)
+        validation_result = check_destination(destination_name)
 
-    if not destination_is_valid:
+    if validation_result == "invalid":
         st.error(
             f"⚠️ Couldn't find **\"{destination_name}\"** as a real place. "
             "Check the spelling, or try a broader name (e.g. 'Porto' instead of a specific street)."
         )
         st.stop()
+    elif validation_result == "unknown":
+        st.warning(
+            "⏳ The geocoding service is temporarily rate-limited and we couldn't verify "
+            f"**\"{destination_name}\"** just now. Please wait a few seconds and click Generate again."
+        )
+        st.stop()
+    # validation_result == "valid" -> fall through and proceed
+
+    # Nominatim allows ~1 request/second. The pre-check above JUST hit it,
+    # and n8n's own geocode_destination tool is about to hit it again the
+    # moment this request lands — this short pause keeps the two calls
+    # from landing in the same second and triggering a self-inflicted 429.
+    time.sleep(1)
 
     # This is the entire payload the n8n workflow's "Build Trip Request"
     # Code node expects — field names must match exactly, since that node
