@@ -21,30 +21,9 @@ st.set_page_config(page_title="TripMate", page_icon="🗺️", layout="wide")
 # =========================================================
 N8N_WEBHOOK_URL = "https://lobali.app.n8n.cloud/webhook/plan-trip"
 
-# Paste your free Geoapify API key here — https://myprojects.geoapify.com
+# free Geoapify API key here — https://myprojects.geoapify.com
 # (free tier: 3000 requests/day). Used for the local pre-check below.
-GEOAPIFY_KEY = "PASTE_YOUR_GEOAPIFY_KEY_HERE"
-
-
-# ---------------------------------------------------------------------------
-# Known coordinates for every city in the curated dropdown — no API call
-# needed for these at all.
-# ---------------------------------------------------------------------------
-KNOWN_DESTINATION_COORDINATES = {
-    "Lisbon, Portugal": (38.7223, -9.1393),
-    "Barcelona, Spain": (41.3874, 2.1686),
-    "Rome, Italy": (41.9028, 12.4964),
-    "Paris, France": (48.8566, 2.3522),
-    "Amsterdam, Netherlands": (52.3676, 4.9041),
-    "Prague, Czech Republic": (50.0755, 14.4378),
-    "Athens, Greece": (37.9838, 23.7275),
-    "Vienna, Austria": (48.2082, 16.3738),
-    "Berlin, Germany": (52.5200, 13.4050),
-    "Istanbul, Turkey": (41.0082, 28.9784),
-    "Marrakech, Morocco": (31.6295, -7.9811),
-    "Bangkok, Thailand": (13.7563, 100.5018),
-    "Tokyo, Japan": (35.6762, 139.6503),
-}
+GEOAPIFY_KEY = "27a3999a117546e39af4fc2eef27df2d"
 
 
 def check_destination(destination_name: str, max_retries: int = 2):
@@ -62,9 +41,6 @@ def check_destination(destination_name: str, max_retries: int = 2):
         detail is None unless status is "unknown", in which case it's the
         actual exception/status code from the last failed attempt.
     """
-    if destination_name in KNOWN_DESTINATION_COORDINATES:
-        return "valid", None
-
     if "destination_check_cache" not in st.session_state:
         st.session_state.destination_check_cache = {}
     cached = st.session_state.destination_check_cache.get(destination_name)
