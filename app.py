@@ -9,6 +9,7 @@ POST to n8n -> render whatever itinerary comes back.
 """
 
 import json
+import re
 import time
 import requests
 import streamlit as st
@@ -21,7 +22,22 @@ st.set_page_config(page_title="TripMate", page_icon="🗺️", layout="wide")
 # =========================================================
 N8N_WEBHOOK_URL = "https://lobali.app.n8n.cloud/webhook/plan-trip"
 
-GEOAPIFY_KEY = st.secrets["GEOAPIFY_KEY"]  # https://myprojects.geoapify.com (free tier: 3000 req/day)
+# Read from Streamlit Cloud's Secrets manager instead of hardcoding —
+# this keeps the key out of your public GitHub repo entirely. Set it via
+# your app's Settings -> Secrets in the Streamlit Cloud dashboard:
+#   GEOAPIFY_KEY = "your_real_key_here"
+GEOAPIFY_KEY = st.secrets["GEOAPIFY_KEY"]
+
+
+# ---------------------------------------------------------------------------
+# English-only input check — see the matching comment in the Python-agent
+# app.py for the reasoning.
+# ---------------------------------------------------------------------------
+ENGLISH_ONLY_PATTERN = re.compile(r"^[A-Za-z0-9\s,.'\-]*$")
+
+
+def is_english_only(text: str) -> bool:
+    return bool(ENGLISH_ONLY_PATTERN.match(text))
 
 
 def check_destination(destination_name: str, max_retries: int = 2):
@@ -34,11 +50,20 @@ def check_destination(destination_name: str, max_retries: int = 2):
     IP, which is what made Nominatim unreliable here even for correctly
     spelled destinations.
 
+    ALSO CHECKS CONFIDENCE, NOT JUST "DID IT FIND ANYTHING": Geoapify's
+    fuzzy matching can match a short/garbled string to something real but
+    wrong — e.g. "riyd" once matched a location in Morocco instead of
+    Riyadh. Geoapify returns properties.rank.confidence (0.0-1.0) per
+    result; anything below CONFIDENCE_THRESHOLD is treated as "invalid"
+    rather than blindly trusted.
+
     Returns:
         (status, detail): status is "valid" / "invalid" / "unknown".
         detail is None unless status is "unknown", in which case it's the
         actual exception/status code from the last failed attempt.
     """
+    CONFIDENCE_THRESHOLD = 0.5
+
     if "destination_check_cache" not in st.session_state:
         st.session_state.destination_check_cache = {}
     cached = st.session_state.destination_check_cache.get(destination_name)
@@ -56,7 +81,13 @@ def check_destination(destination_name: str, max_retries: int = 2):
             )
             response.raise_for_status()
             features = response.json().get("features", [])
-            result = "valid" if features else "invalid"
+
+            if not features:
+                result = "invalid"
+            else:
+                confidence = features[0].get("properties", {}).get("rank", {}).get("confidence", 0)
+                result = "valid" if confidence >= CONFIDENCE_THRESHOLD else "invalid"
+
             st.session_state.destination_check_cache[destination_name] = result
             return result, None
         except requests.exceptions.HTTPError as e:
@@ -138,9 +169,13 @@ with st.sidebar:
     total_budget_usd = st.number_input("💰 Total budget in USD (0 = no limit)", min_value=0, value=0, step=50)
     st.divider()
 
-    can_generate = bool(destination_name.strip()) and bool(checked_interests)
-    if not can_generate:
+    destination_is_english = is_english_only(destination_name)
+
+    can_generate = bool(destination_name.strip()) and bool(checked_interests) and destination_is_english
+    if not destination_name.strip() or not checked_interests:
         st.caption("⚠️ Pick a destination and at least one interest to continue.")
+    elif not destination_is_english:
+        st.caption("⚠️ Please type the destination using English letters only.")
     generate_button_clicked = st.button(
         "✨ Generate itinerary", type="primary", use_container_width=True, disabled=not can_generate
     )
@@ -153,8 +188,8 @@ if generate_button_clicked:
 
     if validation_result == "invalid":
         st.error(
-            f"⚠️ Couldn't find **\"{destination_name}\"** as a real place. "
-            "Check the spelling, or try a broader name (e.g. 'Porto' instead of a specific street)."
+            f"⚠️ Couldn't confidently match **\"{destination_name}\"** to a real place. "
+            "Please rewrite the destination and check the spelling, then try again."
         )
         st.stop()
     elif validation_result == "unknown":
@@ -221,6 +256,18 @@ if generate_button_clicked:
             st.error(f"Couldn't reach the agent: {e}")
             st.stop()
 
+        # DEFENSIVE CHECK: see the matching comment in the Python-agent
+        # app.py — a schema-valid but EMPTY days list (e.g. the agent
+        # trying to ask a clarifying question instead of committing to a
+        # plan) would otherwise crash st.tabs([]).
+        if not itinerary.get("days"):
+            st.warning(
+                "⚠️ The agent couldn't confidently build a full itinerary for this destination — "
+                "it may be too ambiguous or obscure. Try being more specific "
+                "(e.g. 'Riyadh, Saudi Arabia' instead of a short abbreviation)."
+            )
+            st.stop()
+
         st.header(f"{itinerary['destination_name']} · {itinerary['number_of_days']} days")
 
         stat_col1, stat_col2, stat_col3 = st.columns(3)
@@ -228,6 +275,9 @@ if generate_button_clicked:
         stat_col2.metric("💵 Estimated cost", f"${itinerary['total_estimated_cost_usd']:.0f}")
         stat_col3.metric("🏃 Pace", pace.capitalize())
         st.info(f"💡 {itinerary['budget_summary']}")
+
+        if itinerary.get("unmatched_interests_note"):
+            st.warning(f"🔍 {itinerary['unmatched_interests_note']}")
 
         st.divider()
 
