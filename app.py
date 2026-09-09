@@ -276,8 +276,15 @@ if generate_button_clicked:
         stat_col3.metric("🏃 Pace", pace.capitalize())
         st.info(f"💡 {itinerary['budget_summary']}")
 
-        if itinerary.get("unmatched_interests_note"):
-            st.warning(f"🔍 {itinerary['unmatched_interests_note']}")
+        # The agent is instructed to explicitly write "none" (as text) when
+        # every interest was matched, rather than leave the field blank —
+        # so a plain truthiness check here would show an empty-feeling
+        # "🔍 none" box every single time. Treat "none"-style phrasings the
+        # same as an actually-empty string: nothing worth showing the user.
+        unmatched_note = (itinerary.get("unmatched_interests_note") or "").strip()
+        NOTHING_TO_REPORT_PHRASES = {"", "none", "none.", "n/a", "no unmatched interests", "unmatched interests: none"}
+        if unmatched_note.lower() not in NOTHING_TO_REPORT_PHRASES:
+            st.warning(f"🔍 {unmatched_note}")
 
         st.divider()
 
