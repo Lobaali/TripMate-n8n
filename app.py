@@ -3,29 +3,9 @@ app.py — Streamlit UI for TripMate, backed by the n8n agent workflow.
 
     python3 -m streamlit run app.py
 
-WHAT CHANGED FROM THE PYTHON-AGENT VERSION: this file no longer contains
-or imports any planning logic at all. There's no agent.py, no tools.py, no
-schema.py — all of that (the tool-calling loop, the three real API calls,
-the structured-output schema) now lives inside the n8n workflow
-("TripMate_Agent_Webhook.json"). This file's job is:
-
-  1. Collect trip preferences from the sidebar (same UI as before)
-  2. Quickly validate the destination is a real place (see below)
-  3. POST them as JSON to the n8n webhook
-  4. Render whatever itinerary JSON comes back
-
-If you want to change how the agent plans trips (which tools it uses, the
-system prompt, the output schema), you edit the n8n workflow — not this
-file. This file only needs to change if you want to change what's
-COLLECTED from the user, how the destination is PRE-VALIDATED, or how the
-result is DISPLAYED.
-
-WHY THERE'S A DIRECT NOMINATIM CALL HERE: this file has no access to
-tools.py's geocode_destination() — that logic lives inside n8n now. So the
-check_destination() pre-check below makes its own small, direct call
-to the same free geocoding service, purely to reject an obvious typo like
-"asdlkfj" in under a second instead of sending it all the way to n8n,
-waiting through a full agent run, and getting back a raw HTTP error.
+This file has no planning logic — that lives inside the n8n workflow.
+This file: collect trip preferences -> pre-validate the destination ->
+POST to n8n -> render whatever itinerary comes back.
 """
 
 import json
@@ -39,70 +19,91 @@ st.set_page_config(page_title="TripMate", page_icon="🗺️", layout="wide")
 # =========================================================
 # N8N WEBHOOK
 # =========================================================
-
-# Paste your n8n workflow's Webhook node URL here — it's the "Production
-# URL" shown on the Webhook node once the workflow is active, e.g.:
-#   https://your-instance.app.n8n.cloud/webhook/plan-trip
-
 N8N_WEBHOOK_URL = "https://lobali.app.n8n.cloud/webhook/plan-trip"
 
+# Paste your free Geoapify API key here — https://myprojects.geoapify.com
+# (free tier: 3000 requests/day). Used for the local pre-check below.
+GEOAPIFY_KEY = "PASTE_YOUR_GEOAPIFY_KEY_HERE"
 
-def check_destination(destination_name: str, max_retries: int = 3):
+
+# ---------------------------------------------------------------------------
+# Known coordinates for every city in the curated dropdown — no API call
+# needed for these at all.
+# ---------------------------------------------------------------------------
+KNOWN_DESTINATION_COORDINATES = {
+    "Lisbon, Portugal": (38.7223, -9.1393),
+    "Barcelona, Spain": (41.3874, 2.1686),
+    "Rome, Italy": (41.9028, 12.4964),
+    "Paris, France": (48.8566, 2.3522),
+    "Amsterdam, Netherlands": (52.3676, 4.9041),
+    "Prague, Czech Republic": (50.0755, 14.4378),
+    "Athens, Greece": (37.9838, 23.7275),
+    "Vienna, Austria": (48.2082, 16.3738),
+    "Berlin, Germany": (52.5200, 13.4050),
+    "Istanbul, Turkey": (41.0082, 28.9784),
+    "Marrakech, Morocco": (31.6295, -7.9811),
+    "Bangkok, Thailand": (13.7563, 100.5018),
+    "Tokyo, Japan": (35.6762, 139.6503),
+}
+
+
+def check_destination(destination_name: str, max_retries: int = 2):
     """
-    Confirms the destination resolves to a real place via Nominatim (a
-    free geocoding service, no API key needed) BEFORE POSTing to n8n and
-    waiting through a full agent run over a typo.
+    Confirms the destination resolves to a real place, BEFORE POSTing to
+    n8n and waiting through a full agent run.
 
-    WHY THREE OUTCOMES INSTEAD OF TRUE/FALSE: an earlier version of this
-    function failed OPEN on persistent 429s — if Nominatim stayed
-    rate-limited through every retry, it just let the destination through
-    unverified. In practice this meant testing two destinations back to
-    back could exhaust the retry budget on the second one and silently
-    wave real gibberish straight into a full agent run, defeating the
-    entire point of validating first. Now a persistent 429 is reported as
-    "unknown" rather than silently treated as "valid", so the caller can
-    tell the user to wait a moment instead of either blocking forever OR
-    quietly letting garbage through.
+    USES GEOAPIFY, NOT NOMINATIM — see tools.py / the n8n canvas notes for
+    why. Geoapify rate-limits per API KEY, not per shared Streamlit Cloud
+    IP, which is what made Nominatim unreliable here even for correctly
+    spelled destinations.
 
     Returns:
-        "valid"   — Nominatim found a real match.
-        "invalid" — Nominatim reached us fine and found nothing.
-        "unknown" — couldn't get a real answer (rate-limited on every
-                    retry, or a network/timeout issue). The caller should
-                    ask the user to wait and try again, NOT proceed as if
-                    it were valid.
+        (status, detail): status is "valid" / "invalid" / "unknown".
+        detail is None unless status is "unknown", in which case it's the
+        actual exception/status code from the last failed attempt.
     """
+    if destination_name in KNOWN_DESTINATION_COORDINATES:
+        return "valid", None
+
+    if "destination_check_cache" not in st.session_state:
+        st.session_state.destination_check_cache = {}
+    cached = st.session_state.destination_check_cache.get(destination_name)
+    if cached is not None:
+        return cached, None
+
+    last_detail = None
+
     for attempt in range(1, max_retries + 1):
         try:
             response = requests.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={"q": destination_name, "format": "json", "limit": 1},
-                headers={"User-Agent": "TripMate-Validator/1.0"},
+                "https://api.geoapify.com/v1/geocode/search",
+                params={"text": destination_name, "limit": 1, "apiKey": GEOAPIFY_KEY},
                 timeout=8,
             )
             response.raise_for_status()
-            return "valid" if response.json() else "invalid"
+            features = response.json().get("features", [])
+            result = "valid" if features else "invalid"
+            st.session_state.destination_check_cache[destination_name] = result
+            return result, None
         except requests.exceptions.HTTPError as e:
-            is_rate_limited = e.response is not None and e.response.status_code == 429
-            if is_rate_limited and attempt < max_retries:
+            status_code = e.response.status_code if e.response is not None else "no response"
+            response_snippet = (e.response.text[:200] if e.response is not None else "")
+            last_detail = f"Attempt {attempt}/{max_retries}: HTTP {status_code} — {e}\nBody: {response_snippet}"
+            if status_code == 429 and attempt < max_retries:
                 time.sleep(attempt)
                 continue
-            return "unknown"
-        except requests.exceptions.RequestException:
+            return "unknown", last_detail
+        except requests.exceptions.RequestException as e:
+            last_detail = f"Attempt {attempt}/{max_retries}: {type(e).__name__} — {e}"
             if attempt < max_retries:
                 time.sleep(attempt)
                 continue
-            return "unknown"
+            return "unknown", last_detail
 
-    return "unknown"
+    return "unknown", last_detail
 
 
 def pick_emoji_for_category(category_text: str) -> str:
-    """
-    Small COSMETIC helper: pick a fun emoji for a stop based on its
-    category text, purely so the itinerary is easier to scan at a glance.
-    Has zero effect on planning — pure presentation.
-    """
     category_text = (category_text or "").lower()
     keyword_to_emoji = {
         "museum": "🏛️", "art": "🖼️", "gallery": "🖼️",
@@ -123,17 +124,9 @@ st.title("🗺️ TripMate")
 st.caption("Tell me where and how long — I'll build a real, walkable day-by-day plan around what you actually like.")
 
 if not N8N_WEBHOOK_URL:
-    st.error(
-        "Set N8N_WEBHOOK_URL near the top of app.py to your n8n workflow's "
-        "Webhook node URL, e.g. https://your-instance.app.n8n.cloud/webhook/plan-trip"
-    )
+    st.error("Set N8N_WEBHOOK_URL near the top of app.py to your n8n workflow's Webhook node URL.")
     st.stop()
 
-# ---------------------------------------------------------------------------
-# Same curated destination/interest lists as before — this UI is unchanged
-# from the direct-OpenAI version. Only what happens after the button click
-# is different.
-# ---------------------------------------------------------------------------
 DESTINATION_OPTIONS = [
     "Lisbon, Portugal", "Barcelona, Spain", "Rome, Italy", "Paris, France",
     "Amsterdam, Netherlands", "Prague, Czech Republic", "Athens, Greece",
@@ -171,9 +164,6 @@ with st.sidebar:
     total_budget_usd = st.number_input("💰 Total budget in USD (0 = no limit)", min_value=0, value=0, step=50)
     st.divider()
 
-    # Guard against generating with no destination or no interests picked.
-    # (Destination REALNESS is checked after the click, below — not on
-    # every keystroke, so the sidebar itself stays fast.)
     can_generate = bool(destination_name.strip()) and bool(checked_interests)
     if not can_generate:
         st.caption("⚠️ Pick a destination and at least one interest to continue.")
@@ -184,14 +174,8 @@ with st.sidebar:
 
 if generate_button_clicked:
 
-    # -------------------------------------------------------------------
-    # STEP 0: validate the destination BEFORE POSTing to n8n and waiting
-    # through a full agent run. This is what turns "ri" or "asdlkfj" into
-    # an instant, friendly error instead of ~15 seconds followed by a raw
-    # HTTPError traceback bubbling up from n8n's geocode_destination call.
-    # -------------------------------------------------------------------
     with st.spinner("Checking destination..."):
-        validation_result = check_destination(destination_name)
+        validation_result, validation_detail = check_destination(destination_name)
 
     if validation_result == "invalid":
         st.error(
@@ -201,21 +185,13 @@ if generate_button_clicked:
         st.stop()
     elif validation_result == "unknown":
         st.warning(
-            "⏳ The geocoding service is temporarily rate-limited and we couldn't verify "
-            f"**\"{destination_name}\"** just now. Please wait a few seconds and click Generate again."
+            f"⏳ Couldn't verify **\"{destination_name}\"** right now — the geocoding check failed. "
+            "See the technical details below for the actual cause."
         )
+        with st.expander("Technical details (for debugging)", expanded=True):
+            st.code(validation_detail or "No detail captured.")
         st.stop()
-    # validation_result == "valid" -> fall through and proceed
 
-    # Nominatim allows ~1 request/second. The pre-check above JUST hit it,
-    # and n8n's own geocode_destination tool is about to hit it again the
-    # moment this request lands — this short pause keeps the two calls
-    # from landing in the same second and triggering a self-inflicted 429.
-    time.sleep(1)
-
-    # This is the entire payload the n8n workflow's "Build Trip Request"
-    # Code node expects — field names must match exactly, since that node
-    # reads them straight off the webhook's JSON body.
     request_payload = {
         "destination_name": destination_name,
         "number_of_days": number_of_days,
@@ -231,17 +207,8 @@ if generate_button_clicked:
         st.write("📡 Sending your request to the agent...")
 
         try:
-            # timeout is generous because the n8n workflow itself runs a
-            # full tool-calling agent loop (multiple LLM + API round trips)
-            # before it can respond — this can genuinely take 15-30+ seconds.
             response = requests.post(N8N_WEBHOOK_URL, json=request_payload, timeout=120)
 
-            # DEBUG: requests silently converts POST to GET when following a
-            # 301/302 redirect. If N8N_WEBHOOK_URL doesn't exactly match
-            # n8n's expected URL (trailing slash, http vs https, etc.), a
-            # redirect can happen here and your POST becomes a GET before
-            # n8n ever sees it — which is exactly the "not registered for
-            # GET requests" error. This shows if that happened.
             if response.history:
                 redirect_chain = " -> ".join(r.url for r in response.history) + " -> " + response.url
                 st.warning(f"⚠️ Request was redirected (this may have turned your POST into a GET): {redirect_chain}")
@@ -279,7 +246,6 @@ if generate_button_clicked:
             status.update(label="❌ Request failed", state="error")
             st.error(f"Couldn't reach the agent: {e}")
             st.stop()
-
 
         st.header(f"{itinerary['destination_name']} · {itinerary['number_of_days']} days")
 
