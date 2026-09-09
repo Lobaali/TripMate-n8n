@@ -21,9 +21,7 @@ st.set_page_config(page_title="TripMate", page_icon="🗺️", layout="wide")
 # =========================================================
 N8N_WEBHOOK_URL = "https://lobali.app.n8n.cloud/webhook/plan-trip"
 
-# free Geoapify API key here — https://myprojects.geoapify.com
-# (free tier: 3000 requests/day). Used for the local pre-check below.
-GEOAPIFY_KEY = "27a3999a117546e39af4fc2eef27df2d"
+GEOAPIFY_KEY = os.environ["GEOAPIFY_KEY"]  # https://myprojects.geoapify.com (free tier: 3000 req/day)
 
 
 def check_destination(destination_name: str, max_retries: int = 2):
